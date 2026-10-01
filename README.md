@@ -29,6 +29,8 @@ This self-built app is ad-hoc signed, not Developer ID signed or notarized by Ap
 
 **Try disposable data only before using the app on anything important. Deletion bypasses Trash and cannot be undone.**
 
+The main window shows the drop area without a persistent warning banner. Erasure limitations remain in the confirmation dialog.
+
 1. Drag files or folders from Finder into **Drop files or folders here**.
 2. Review the queued items. **Clear** removes the queue without erasing files.
 3. Click **Erase …**, read the warning, and confirm **Overwrite and Delete** only for the intended items.

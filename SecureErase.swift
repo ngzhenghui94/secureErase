@@ -142,10 +142,6 @@ struct ContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label("Best-effort logical deletion only. SSD remnants, snapshots, backups and copies can remain. FileVault is not individual-file sanitization.",
-                  systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-
             RoundedRectangle(cornerRadius: 12)
                 .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [8]))
                 .foregroundStyle(targeted ? Color.red : Color.secondary)
