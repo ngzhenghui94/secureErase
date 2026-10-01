@@ -1,17 +1,20 @@
 import SwiftUI
+import CryptoKit
 
 enum Shredder {
     struct Failure: LocalizedError {
         let errorDescription: String?
     }
 
-    /// Overwrites file contents with random data, flushes to disk, anonymises the name, then unlinks.
+    /// Best-effort logical verification of overwritten data/resource forks before deletion.
+    /// SSD remnants, snapshots, backups, copies and filename history may survive.
     /// Folders are processed recursively. Symlinks are removed without touching their target.
     static func erase(_ url: URL) throws {
         let fm = FileManager.default
-        let v = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
-        if v.isSymbolicLink != true {
-            if v.isDirectory == true {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else { throw posix(url) }
+        if st.st_mode & S_IFMT != S_IFLNK {
+            if st.st_mode & S_IFMT == S_IFDIR {
                 for child in try fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) {
                     try erase(child)
                 }
@@ -19,33 +22,101 @@ enum Shredder {
                 try overwrite(url)
             }
         }
-        // Rename first so the original filename doesn't linger in directory metadata.
         let anon = url.deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
         try fm.moveItem(at: url, to: anon)
         try fm.removeItem(at: anon)
     }
 
     static func overwrite(_ url: URL) throws {
-        chmod(url.path, S_IRUSR | S_IWUSR)  // read-only files are still ours to destroy
-        let fd = open(url.path, O_WRONLY | O_NOFOLLOW)
+        // Validate before any permission or content change; never follow a symlink.
+        let check = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard check >= 0 else { throw posix(url) }
+        defer { close(check) }
+        let original = try regularSingleLink(check, url)
+        if original.st_mode & S_IWUSR == 0 {
+            guard fchmod(check, original.st_mode | S_IRUSR | S_IWUSR) == 0 else { throw posix(url) }
+        }
+        let fd = open(url.path, O_RDWR | O_NOFOLLOW | O_NONBLOCK)
         guard fd >= 0 else { throw posix(url) }
         defer { close(fd) }
+        let opened = try regularSingleLink(fd, url)
+        guard opened.st_dev == original.st_dev && opened.st_ino == original.st_ino else {
+            throw Failure(errorDescription: "\(url.lastPathComponent): file changed while opening")
+        }
+        // Detect absence through the validated descriptor; other errors fail closed.
+        let resourceSize = fgetxattr(fd, "com.apple.ResourceFork", nil, 0, 0, 0)
+        if resourceSize < 0 && errno != ENOATTR { throw posix(url) }
+        var resource: Int32 = -1
+        if resourceSize > 0 {
+            resource = open(url.path + "/..namedfork/rsrc", O_RDWR | O_NOFOLLOW | O_NONBLOCK)
+            guard resource >= 0 else { throw posix(url) }
+        }
+        defer { if resource >= 0 { close(resource) } }
+        if resource >= 0 {
+            let fork = try regularSingleLink(resource, url)
+            guard fork.st_dev == opened.st_dev && fork.st_ino == opened.st_ino else {
+                throw Failure(errorDescription: "\(url.lastPathComponent): resource fork changed while opening")
+            }
+        }
+        var buffer = [UInt8](repeating: 0, count: 1 << 20)
+        try overwriteAndVerify(fd, url, &buffer)
+        if resource >= 0 { try overwriteAndVerify(resource, url, &buffer) }
+        // Both forks must pass logical verification before either is truncated.
+        guard ftruncate(fd, 0) == 0 else { throw posix(url) }
+        if resource >= 0 {
+            guard ftruncate(resource, 0) == 0 else { throw posix(url) }
+            guard fcntl(resource, F_FULLFSYNC) == 0 else { throw posix(url) }
+        }
+        guard fcntl(fd, F_FULLFSYNC) == 0 else { throw posix(url) }
+    }
 
+    private static func regularSingleLink(_ fd: Int32, _ url: URL) throws -> stat {
         var st = stat()
         guard fstat(fd, &st) == 0 else { throw posix(url) }
-        let size = Int(st.st_size)
-        var buf = [UInt8](repeating: 0, count: 1 << 20)
-        var off = 0
-        while off < size {
-            let n = min(size - off, buf.count)
-            arc4random_buf(&buf, n)
-            let w = buf.withUnsafeBytes { pwrite(fd, $0.baseAddress, n, off_t(off)) }
-            guard w > 0 else { throw posix(url) }
-            off += w
+        guard st.st_mode & S_IFMT == S_IFREG else {
+            throw Failure(errorDescription: "\(url.lastPathComponent): refusing non-regular file")
         }
-        // F_FULLFSYNC forces the drive to commit its cache, plain fsync doesn't on macOS.
+        guard st.st_nlink == 1 else {
+            throw Failure(errorDescription: "\(url.lastPathComponent): refusing multiple hard links to preserve unselected files")
+        }
+        return st
+    }
+
+    private static func overwriteAndVerify(_ fd: Int32, _ url: URL, _ buffer: inout [UInt8]) throws {
+        let size = try regularSingleLink(fd, url).st_size
+        var expected = SHA256()
+        var offset: off_t = 0
+        while offset < size {
+            let count = Int(min(size - offset, off_t(buffer.count)))
+            buffer.withUnsafeMutableBytes { arc4random_buf($0.baseAddress!, count) }
+            try buffer.withUnsafeBytes { bytes in
+                var written = 0
+                while written < count {
+                    let n = pwrite(fd, bytes.baseAddress!.advanced(by: written), count - written, offset + off_t(written))
+                    if n < 0 && errno == EINTR { continue }
+                    guard n > 0 else { throw posix(url) }
+                    written += n
+                }
+                expected.update(bufferPointer: UnsafeRawBufferPointer(rebasing: bytes[..<count]))
+            }
+            offset += off_t(count)
+        }
+        // Flush requested writes. Read-back checks logical bytes, NOT physical media remnants.
         guard fcntl(fd, F_FULLFSYNC) == 0 else { throw posix(url) }
-        guard ftruncate(fd, 0) == 0 else { throw posix(url) }
+        var actual = SHA256()
+        offset = 0
+        while offset < size {
+            let count = Int(min(size - offset, off_t(buffer.count)))
+            let n = buffer.withUnsafeMutableBytes { pread(fd, $0.baseAddress!, count, offset) }
+            if n < 0 && errno == EINTR { continue }
+            guard n > 0 else { throw Failure(errorDescription: "\(url.lastPathComponent): logical read-back failed") }
+            buffer.withUnsafeBytes { actual.update(bufferPointer: UnsafeRawBufferPointer(rebasing: $0[..<n])) }
+            offset += off_t(n)
+        }
+        let final = try regularSingleLink(fd, url)
+        guard final.st_size == size && expected.finalize() == actual.finalize() else {
+            throw Failure(errorDescription: "\(url.lastPathComponent): logical read-back mismatch; not deleting")
+        }
     }
 
     static func posix(_ url: URL) -> Failure {
@@ -59,15 +130,7 @@ enum Shredder {
         return p == "/" || p == NSHomeDirectory() || isVolume == true
     }
 
-    static var fileVaultOn: Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/fdesetup")
-        p.arguments = ["isactive"]
-        p.standardOutput = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return false }
-        p.waitUntilExit()
-        return p.terminationStatus == 0
-    }
+
 }
 
 struct ContentView: View {
@@ -76,15 +139,12 @@ struct ContentView: View {
     @State private var busy = false
     @State private var confirm = false
     @State private var targeted = false
-    private let fileVaultOn = Shredder.fileVaultOn
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if !fileVaultOn {
-                Label("FileVault is off. On SSDs, overwriting can't guarantee old blocks are gone — turn on FileVault for real protection.",
-                      systemImage: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-            }
+            Label("Best-effort logical deletion only. SSD remnants, snapshots, backups and copies can remain. FileVault is not individual-file sanitization.",
+                  systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
 
             RoundedRectangle(cornerRadius: 12)
                 .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [8]))
@@ -135,10 +195,10 @@ struct ContentView: View {
         }
         .padding()
         .frame(minWidth: 480, minHeight: 320)
-        .confirmationDialog("Permanently erase ^[\(items.count) item](inflect: true)?", isPresented: $confirm) {
-            Button("Erase Forever", role: .destructive) { run() }
+        .confirmationDialog("Best-effort erase ^[\(items.count) item](inflect: true)?", isPresented: $confirm) {
+            Button("Overwrite and Delete", role: .destructive) { run() }
         } message: {
-            Text("Contents are overwritten and deleted. This cannot be undone.")
+            Text("Selected regular files have their data and resource forks overwritten, flushed and logically read back before deletion. Symlinks are deleted without following targets; hardlinked and special files are refused. SSD remnants, snapshots, backups and copies can remain, even with FileVault. Failures may leave partially erased files. This operation cannot be undone.")
         }
     }
 
@@ -160,9 +220,9 @@ struct ContentView: View {
                 let msg: String
                 do {
                     try Shredder.erase(u)
-                    msg = "✓ \(u.path)"
+                    msg = "✓ Logically deleted: \(u.path) — remnants and other copies may remain"
                 } catch {
-                    msg = "✗ \(u.path) — \(error.localizedDescription)"
+                    msg = "✗ \(u.path) — \(error.localizedDescription). Partial erasure may have occurred."
                 }
                 await MainActor.run {
                     log.append(msg)
@@ -198,6 +258,45 @@ func selfTest() {
     try! Shredder.overwrite(probe)
     precondition((try! fm.attributesOfItem(atPath: probe.path)[.size] as! Int) == 0, "file should be truncated")
     try! fm.removeItem(at: probe)
+
+    // Boundary sizes and a resource-only file exercise both logical forks.
+    for size in [0, 1, (1 << 20) - 1, 1 << 20, (1 << 20) + 1, (3 << 20) + 17] {
+        let file = root.appendingPathComponent("probe-\(size)")
+        try! Data(repeating: 0x42, count: size).write(to: file)
+        let fork = URL(fileURLWithPath: file.path + "/..namedfork/rsrc")
+        try! Data(repeating: 0x52, count: (1 << 20) + 7).write(to: fork)
+        try! Shredder.overwrite(file)
+        precondition((try! Data(contentsOf: file)).isEmpty, "data fork must be truncated")
+        precondition((try! Data(contentsOf: fork)).isEmpty, "resource fork must be truncated")
+    }
+    func mustRefuse(_ file: URL) {
+        do {
+            try Shredder.overwrite(file)
+            preconditionFailure("unsafe overwrite accepted: \(file.path)")
+        } catch { }
+    }
+    // A direct overwrite of a link must not chmod or overwrite its destination.
+    chmod(outside.path, S_IRUSR)
+    mustRefuse(root.appendingPathComponent("link"))
+    var outsideStat = stat()
+    precondition(lstat(outside.path, &outsideStat) == 0)
+    precondition(outsideStat.st_mode & 0o777 == S_IRUSR, "symlink target permissions changed")
+    precondition((try! Data(contentsOf: outside)) == Data("keep".utf8))
+    let hard = root.appendingPathComponent("hard")
+    precondition(link(outside.path, hard.path) == 0)
+    mustRefuse(hard)
+    do {
+        try Shredder.erase(hard)
+        preconditionFailure("hardlinked erase accepted")
+    } catch { }
+    precondition(lstat(outside.path, &outsideStat) == 0)
+    precondition(outsideStat.st_mode & 0o777 == S_IRUSR, "hardlink permissions changed")
+    precondition((try! Data(contentsOf: hard)) == Data("keep".utf8), "hardlink bytes changed")
+    try! fm.removeItem(at: hard)
+    let fifo = root.appendingPathComponent("fifo")
+    precondition(mkfifo(fifo.path, S_IRUSR | S_IWUSR) == 0)
+    mustRefuse(fifo)
+    try! fm.removeItem(at: fifo)
 
     try! Shredder.erase(root)
     precondition(!fm.fileExists(atPath: root.path), "root should be gone")
