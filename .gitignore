@@ -1,3 +1,5 @@
 /.build/
+/build/
 /SecureErase.app/
 .DS_Store
+__pycache__/
