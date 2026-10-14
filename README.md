@@ -36,6 +36,8 @@ brew install --cask ngzhenghui94/tap/secureerase
 
 If a build fails, preserve `build/releases`, `notarization.json`, any Apple submission/GitHub draft, and `build/update-tap`. Inspect any unpushed tap commit before retrying. Never blindly resubmit an unknown Apple result, overwrite assets, or remove the build lock while its process is running. Interrupted attempts reserve their versions; subsequent builds advance past them.
 
+Update-key access goes through `signing.swift`: it disables Keychain interaction before reading the existing key, checks it against the bundle's pinned public key, and passes it only through an anonymous stdin pipe to Sparkle. Missing, locked, approval-required, or mismatched keys fail closed; there is no retry, key generation, rotation, key file, or permission change. Signature verification uses public-only CryptoKit without Keychain access. This helper does not make Developer ID signing or the notarization profile noninteractive; do not resume those stages while their separate no-prompt prerequisite is unresolved.
+
 ## Use
 
 **Try disposable data only before using the app on anything important. Deletion bypasses Trash and cannot be undone.**
