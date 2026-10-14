@@ -8,20 +8,20 @@ enum Shredder {
 
     /// Best-effort logical verification of overwritten data/resource forks before deletion.
     /// SSD remnants, snapshots, backups, copies and filename history may survive.
-    /// Folders are processed recursively. Symlinks are removed without touching their target.
+    /// Folders are processed recursively. Symlinks are removed without touching their target;
+    /// sockets, FIFOs and devices are unlinked.
     static func erase(_ url: URL) throws {
         let fm = FileManager.default
         var st = stat()
         guard lstat(url.path, &st) == 0 else { throw posix(url) }
-        if st.st_mode & S_IFMT != S_IFLNK {
-            if st.st_mode & S_IFMT == S_IFDIR {
-                for child in try fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) {
-                    try erase(child)
-                }
-            } else {
-                try overwrite(url)
+        if st.st_mode & S_IFMT == S_IFDIR {
+            for child in try fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) {
+                try erase(child)
             }
+        } else if st.st_mode & S_IFMT == S_IFREG {
+            try overwrite(url)
         }
+        // Symlinks, sockets, FIFOs and devices hold no file data: just unlink them.
         let anon = url.deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
         try fm.moveItem(at: url, to: anon)
         try fm.removeItem(at: anon)
@@ -304,7 +304,7 @@ func selfTest() {
     let fifo = root.appendingPathComponent("fifo")
     precondition(mkfifo(fifo.path, S_IRUSR | S_IWUSR) == 0)
     mustRefuse(fifo)
-    try! fm.removeItem(at: fifo)
+    // erase() must unlink non-regular entries (e.g. git's fsmonitor socket) instead of aborting.
 
     try! Shredder.erase(root)
     precondition(!fm.fileExists(atPath: root.path), "root should be gone")
