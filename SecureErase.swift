@@ -136,6 +136,7 @@ enum Shredder {
 struct ContentView: View {
     @State private var items: [URL] = []
     @State private var log: [String] = []
+    @ObservedObject private var updates = AppUpdates.shared
     @State private var busy = false
     @State private var confirm = false
     @State private var targeted = false
@@ -199,6 +200,7 @@ struct ContentView: View {
     }
 
     private func add(_ urls: [URL]) {
+        guard !busy, !updates.installing, !updates.quitting else { return }
         for u in urls where u.isFileURL && !items.contains(u) {
             if Shredder.isForbidden(u) {
                 log.append("Refused: \(u.path)")
@@ -209,6 +211,8 @@ struct ContentView: View {
     }
 
     private func run() {
+        guard !busy, !updates.installing, !updates.quitting, !items.isEmpty else { return }
+        updates.activeOperations += 1
         let targets = items
         busy = true
         Task.detached {
@@ -225,14 +229,22 @@ struct ContentView: View {
                     items.removeAll { $0 == u }
                 }
             }
-            await MainActor.run { busy = false }
+            await MainActor.run { busy = false; updates.activeOperations -= 1 }
         }
     }
 }
 
 struct EraserApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @StateObject private var updates = AppUpdates.shared
     var body: some Scene {
         WindowGroup("Secure Erase") { ContentView() }
+            .commands {
+                CommandGroup(after: .appInfo) {
+                    Button("Check for Updates…") { updates.checkForUpdates() }
+                        .disabled(!updates.canCheckForUpdates || updates.isBusy || updates.installing || updates.quitting)
+                }
+            }
     }
 }
 
@@ -305,9 +317,10 @@ func selfTest() {
 
 @main
 struct Main {
-    static func main() {
+    @MainActor static func main() async {
         if CommandLine.arguments.contains("--selftest") {
             selfTest()
+            do { try await AppUpdates.selfTest() } catch { fatalError(error.localizedDescription) }
             return
         }
         EraserApp.main()
